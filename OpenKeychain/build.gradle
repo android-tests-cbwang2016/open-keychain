@@ -122,7 +122,7 @@ android {
 
     buildTypes {
         release {
-            minifyEnabled true
+//            minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android.txt'),
                           'proguard-rules-base.pro',
                           'proguard-rules-bouncycastle.pro',
