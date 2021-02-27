@@ -106,6 +106,8 @@ android {
         // with android studio single test execution. use it to generate coverage
         // data, but keep the other one otherwis
         // testInstrumentationRunner "org.sufficientlysecure.keychain.JacocoWorkaroundJUnitRunner"
+        
+        multiDexEnabled true
     }
 
     compileOptions {
