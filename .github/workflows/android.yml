@@ -22,7 +22,7 @@ jobs:
         uses: actions/upload-artifact@v2
         with:
           name: apk
-          path: OpenKeychain/build/outputs/apk/release/*.apk 
+          path: OpenKeychain/build/outputs/apk/*.apk 
   release:
     name: Release APK
     needs: apk
