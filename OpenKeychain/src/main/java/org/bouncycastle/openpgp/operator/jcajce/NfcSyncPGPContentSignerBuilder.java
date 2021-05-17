@@ -13,6 +13,7 @@ import org.bouncycastle.openpgp.operator.PGPContentSigner;
 import org.bouncycastle.openpgp.operator.PGPContentSignerBuilder;
 import org.bouncycastle.openpgp.operator.PGPDigestCalculator;
 
+import java.io.ByteArrayOutputStream;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.security.Provider;
@@ -29,6 +30,7 @@ public class NfcSyncPGPContentSignerBuilder
     implements PGPContentSignerBuilder
 {
     private JcaPGPDigestCalculatorProviderBuilder digestCalculatorProviderBuilder = new JcaPGPDigestCalculatorProviderBuilder();
+    private boolean enablePreHash;
     private int     hashAlgorithm;
     private int     keyAlgorithm;
     private long    keyID;
@@ -48,11 +50,12 @@ public class NfcSyncPGPContentSignerBuilder
         }
     }
 
-    public NfcSyncPGPContentSignerBuilder(int keyAlgorithm, int hashAlgorithm, long keyID, Map signedHashes)
+    public NfcSyncPGPContentSignerBuilder(int keyAlgorithm, long keyID, boolean enablePreHash, int hashAlgorithm, Map signedHashes)
     {
         this.keyAlgorithm = keyAlgorithm;
-        this.hashAlgorithm = hashAlgorithm;
         this.keyID = keyID;
+        this.enablePreHash = enablePreHash;
+        this.hashAlgorithm = hashAlgorithm;
         this.signedHashes = signedHashes;
     }
 
@@ -93,10 +96,21 @@ public class NfcSyncPGPContentSignerBuilder
     public PGPContentSigner build(final int signatureType, final long keyID)
         throws PGPException
     {
-        final PGPDigestCalculator digestCalculator = digestCalculatorProviderBuilder.build().get(hashAlgorithm);
+
+        final PGPDigestCalculator digestCalculator;
+        final OutputStream outputStream;
+        if (enablePreHash) {
+            digestCalculator = digestCalculatorProviderBuilder.build().get(hashAlgorithm);
+            outputStream = digestCalculator.getOutputStream();
+        } else {
+            digestCalculator = null;
+            outputStream = new ByteArrayOutputStream();
+        }
 
         return new PGPContentSigner()
         {
+            private byte[] digest;
+
             public int getType()
             {
                 return signatureType;
@@ -119,24 +133,32 @@ public class NfcSyncPGPContentSignerBuilder
 
             public OutputStream getOutputStream()
             {
-                return digestCalculator.getOutputStream();
+                return outputStream;
             }
 
             public byte[] getSignature() {
-                byte[] digest = digestCalculator.getDigest();
-                ByteBuffer buf = ByteBuffer.wrap(digest);
+                ByteBuffer buf = ByteBuffer.wrap(getDigest());
                 if (signedHashes.containsKey(buf)) {
                     return (byte[]) signedHashes.get(buf);
                 }
                 // catch this when signatureGenerator.generate() is executed and divert digest to card,
                 // when doing the operation again reuse creationTimestamp (this will be hashed)
-                throw new NfcInteractionNeeded(digest, getHashAlgorithm());
+                throw new NfcInteractionNeeded(getDigest(), getHashAlgorithm());
             }
 
             public byte[] getDigest()
             {
-                return digestCalculator.getDigest();
+                if (digest != null) {
+                    return digest;
+                }
+                if (enablePreHash) {
+                    digest = digestCalculator.getDigest();
+                } else {
+                    digest = ((ByteArrayOutputStream) getOutputStream()).toByteArray();
+                }
+                return digest;
             }
         };
     }
+
 }

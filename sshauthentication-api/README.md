@@ -15,15 +15,10 @@ Add this to your build.gradle:
 
 ```gradle
 repositories {
-    jcenter()
+    maven { url 'https://jitpack.io' }
 }
 
 dependencies {
-    compile 'org.sufficientlysecure:sshauthentication-api:1.0'
+    implementation 'com.github.open-keychain.open-keychain:sshauthentication-api:v5.7.1'
 }
 ```
-
-### Build library
-1. Go to root dir of OpenKeychain repo
-2. Build: ``./gradlew :sshauthentication-api:assemble``
-2. Release on bintray: ``./gradlew :sshauthentication-api:bintrayUpload -PbintrayUser=sufficientlysecure -PbintrayKey=INSERT-KEY -PdryRun=false``

@@ -21,7 +21,6 @@ package org.sufficientlysecure.keychain.securitytoken.operations;
 import androidx.annotation.NonNull;
 import androidx.annotation.VisibleForTesting;
 
-import org.bouncycastle.asn1.cryptlib.CryptlibObjectIdentifiers;
 import org.bouncycastle.asn1.x9.ECNamedCurveTable;
 import org.bouncycastle.asn1.x9.X9ECParameters;
 import org.bouncycastle.jcajce.util.MessageDigestUtils;
@@ -34,9 +33,10 @@ import org.bouncycastle.util.encoders.Hex;
 import org.sufficientlysecure.keychain.pgp.CanonicalizedPublicKey;
 import org.sufficientlysecure.keychain.securitytoken.CardException;
 import org.sufficientlysecure.keychain.securitytoken.CommandApdu;
-import org.sufficientlysecure.keychain.securitytoken.ECKeyFormat;
+import org.sufficientlysecure.keychain.securitytoken.EcKeyFormat;
 import org.sufficientlysecure.keychain.securitytoken.KeyFormat;
 import org.sufficientlysecure.keychain.securitytoken.ResponseApdu;
+import org.sufficientlysecure.keychain.securitytoken.RsaKeyFormat;
 import org.sufficientlysecure.keychain.securitytoken.SecurityTokenConnection;
 
 import java.io.IOException;
@@ -50,20 +50,25 @@ import javax.crypto.NoSuchPaddingException;
 import javax.crypto.spec.SecretKeySpec;
 
 
-/** This class implements the PSO:DECIPHER operation, as specified in OpenPGP card spec / 7.2.11 (p52 in v3.0.1).
- *
+/**
+ * This class implements the PSO:DECIPHER operation, as specified in OpenPGP card spec / 7.2.11 (p52 in v3.0.1).
+ * <p>
  * See https://www.g10code.com/docs/openpgp-card-3.0.pdf
  */
 public class PsoDecryptTokenOp {
     private final SecurityTokenConnection connection;
     private final JcaKeyFingerprintCalculator fingerprintCalculator;
 
+    private static final byte[] DECIPHER_EXTERNAL_PUBLIC_KEY = Hex.decode("86");
+    private static final byte[] DECIPHER_PUBLIC_KEY_DO = Hex.decode("7F49");
+    private static final byte[] DECIPHER_CIPHER_DO = Hex.decode("A6");
+
     public static PsoDecryptTokenOp create(SecurityTokenConnection connection) {
         return new PsoDecryptTokenOp(connection, new JcaKeyFingerprintCalculator());
     }
 
     private PsoDecryptTokenOp(SecurityTokenConnection connection,
-            JcaKeyFingerprintCalculator jcaKeyFingerprintCalculator) {
+                              JcaKeyFingerprintCalculator jcaKeyFingerprintCalculator) {
         this.connection = connection;
         this.fingerprintCalculator = jcaKeyFingerprintCalculator;
     }
@@ -73,15 +78,12 @@ public class PsoDecryptTokenOp {
         connection.verifyPinForOther();
 
         KeyFormat kf = connection.getOpenPgpCapabilities().getEncryptKeyFormat();
-        switch (kf.keyFormatType()) {
-            case RSAKeyFormatType:
-                return decryptSessionKeyRsa(encryptedSessionKeyMpi);
-
-            case ECKeyFormatType:
-                return decryptSessionKeyEcdh(encryptedSessionKeyMpi, (ECKeyFormat) kf, publicKey);
-
-            default:
-                throw new CardException("Unknown encryption key type!");
+        if (kf instanceof RsaKeyFormat) {
+            return decryptSessionKeyRsa(encryptedSessionKeyMpi);
+        } else if (kf instanceof EcKeyFormat) {
+            return decryptSessionKeyEcdh(encryptedSessionKeyMpi, (EcKeyFormat) kf, publicKey);
+        } else {
+            throw new CardException("Unknown encryption key type!");
         }
     }
 
@@ -112,7 +114,7 @@ public class PsoDecryptTokenOp {
         return psoDecipherPayload;
     }
 
-    private byte[] decryptSessionKeyEcdh(byte[] encryptedSessionKeyMpi, ECKeyFormat eckf, CanonicalizedPublicKey publicKey)
+    private byte[] decryptSessionKeyEcdh(byte[] encryptedSessionKeyMpi, EcKeyFormat eckf, CanonicalizedPublicKey publicKey)
             throws IOException {
         int mpiLength = getMpiLength(encryptedSessionKeyMpi);
         byte[] encryptedPoint = Arrays.copyOfRange(encryptedSessionKeyMpi, 2, mpiLength + 2);
@@ -125,21 +127,21 @@ public class PsoDecryptTokenOp {
         } else {
             dataLen = new byte[]{(byte) 0x81, (byte) psoDecipherPayload.length};
         }
-        psoDecipherPayload = Arrays.concatenate(Hex.decode("86"), dataLen, psoDecipherPayload);
+        psoDecipherPayload = Arrays.concatenate(DECIPHER_EXTERNAL_PUBLIC_KEY, dataLen, psoDecipherPayload);
 
         if (psoDecipherPayload.length < 128) {
             dataLen = new byte[]{(byte) psoDecipherPayload.length};
         } else {
             dataLen = new byte[]{(byte) 0x81, (byte) psoDecipherPayload.length};
         }
-        psoDecipherPayload = Arrays.concatenate(Hex.decode("7F49"), dataLen, psoDecipherPayload);
+        psoDecipherPayload = Arrays.concatenate(DECIPHER_PUBLIC_KEY_DO, dataLen, psoDecipherPayload);
 
         if (psoDecipherPayload.length < 128) {
             dataLen = new byte[]{(byte) psoDecipherPayload.length};
         } else {
             dataLen = new byte[]{(byte) 0x81, (byte) psoDecipherPayload.length};
         }
-        psoDecipherPayload = Arrays.concatenate(Hex.decode("A6"), dataLen, psoDecipherPayload);
+        psoDecipherPayload = Arrays.concatenate(DECIPHER_CIPHER_DO, dataLen, psoDecipherPayload);
 
         CommandApdu command = connection.getCommandFactory().createDecipherCommand(
                 psoDecipherPayload, encryptedPoint.length);
@@ -162,17 +164,34 @@ public class PsoDecryptTokenOp {
            From rfc6637#section-13 :
            This document explicitly discourages the use of algorithms other than AES as a KEK algorithm.
        */
-        byte[] keyEncryptionKey = response.getData();
+        byte[] point = response.getData();
 
-        final byte[] keyEnc = new byte[encryptedSessionKeyMpi[mpiLength + 2]];
+        /* From rfc6637#section-7 :
+           The input of KDF should be the x portion of the point.
+           As the result of ECDH can be expressed in two formats: compressed and uncompressed,
+           we have to deal with each case:
+           An uncompressed point is encoded as 04 || x || y, with x and y are of the same size.
+           However, a valid x may be led with 04, so we have to also check the length of the result.
+           A compressed point, on the other hand, is encoded as x only. Therefore, we use the value directly.
+        */
+        final byte[] pointX;
+        boolean isUncompressedPoint = point[0] == 0x04 && point.length % 2 == 1;
+        if (isUncompressedPoint) {
+            int lengthX = (point.length - 1) / 2;
+            pointX = new byte[lengthX];
+            System.arraycopy(point, 1, pointX, 0, lengthX);
+        } else {
+            pointX = point;
+        }
 
-        System.arraycopy(encryptedSessionKeyMpi, 2 + mpiLength + 1, keyEnc, 0, keyEnc.length);
+        final byte[] encryptedKey = new byte[encryptedSessionKeyMpi[mpiLength + 2]];
+        System.arraycopy(encryptedSessionKeyMpi, 2 + mpiLength + 1, encryptedKey, 0, encryptedKey.length);
 
         try {
             final MessageDigest kdf = MessageDigest.getInstance(MessageDigestUtils.getDigestName(publicKey.getSecurityTokenHashAlgorithm()));
 
             kdf.update(new byte[]{(byte) 0, (byte) 0, (byte) 0, (byte) 1});
-            kdf.update(keyEncryptionKey);
+            kdf.update(pointX);
             kdf.update(publicKey.createUserKeyingMaterial(fingerprintCalculator));
 
             byte[] kek = kdf.digest();
@@ -180,7 +199,7 @@ public class PsoDecryptTokenOp {
 
             c.init(Cipher.UNWRAP_MODE, new SecretKeySpec(kek, 0, publicKey.getSecurityTokenSymmetricKeySize() / 8, "AES"));
 
-            Key paddedSessionKey = c.unwrap(keyEnc, "Session", Cipher.SECRET_KEY);
+            Key paddedSessionKey = c.unwrap(encryptedKey, "Session", Cipher.SECRET_KEY);
 
             Arrays.fill(kek, (byte) 0);
 
@@ -196,12 +215,11 @@ public class PsoDecryptTokenOp {
         }
     }
 
-    private byte[] getEcDecipherPayload(ECKeyFormat eckf, byte[] encryptedPoint) throws CardException {
-        // TODO is this the right curve?
-        if (CryptlibObjectIdentifiers.curvey25519.equals(eckf.asn1ParseOid())) {
+    private byte[] getEcDecipherPayload(EcKeyFormat eckf, byte[] encryptedPoint) throws CardException {
+        if (eckf.isX25519()) {
             return Arrays.copyOfRange(encryptedPoint, 1, 33);
         } else {
-            X9ECParameters x9Params = ECNamedCurveTable.getByOID(eckf.asn1ParseOid());
+            X9ECParameters x9Params = ECNamedCurveTable.getByOID(eckf.curveOid());
             ECPoint p = x9Params.getCurve().decodePoint(encryptedPoint);
             if (!p.isValid()) {
                 throw new CardException("Invalid EC point!");
